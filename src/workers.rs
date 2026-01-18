@@ -1,14 +1,13 @@
-use crate::HashAlgorithms;
-use crate::ServerMetrics;
-use crate::constants::*;
-use crate::crypto::hash_reader;
-use crate::network::HashingPacket;
-use sha2::Sha256;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use crate::{
+    FilePath, HashAlgorithms, ServerMetrics, constants::*, crypto::HashError, crypto::hash_reader,
+    network::{HashingPacket, ProtocolMessage},
+};
+use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
+use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
+use std::fs;
+use std::io::Read;
+use std::sync::{Arc, atomic::Ordering};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 #[derive(Debug, Copy, Clone)]
 pub enum Task {
@@ -28,12 +27,12 @@ impl Task {
 
 pub struct WorkItem {
     packet: HashingPacket,
-    responder: oneshot::Sender<String>,
+    responder: oneshot::Sender<ProtocolMessage>,
 }
 
 impl WorkItem {
     #[inline]
-    pub fn new(packet: HashingPacket, responder: oneshot::Sender<String>) -> Self {
+    pub fn new(packet: HashingPacket, responder: oneshot::Sender<ProtocolMessage>) -> Self {
         Self { packet, responder }
     }
 
@@ -41,7 +40,6 @@ impl WorkItem {
         &self.packet
     }
 }
-
 pub async fn start_worker_pool(
     receiver: mpsc::Receiver<WorkItem>,
     num_workers: usize,
@@ -52,6 +50,7 @@ pub async fn start_worker_pool(
     for id in 0..num_workers {
         let rx = Arc::clone(&receiver);
         let metrics = Arc::clone(&metrics);
+        
         tokio::spawn(async move {
             println!("Worker {} started", id);
             loop {
@@ -61,26 +60,55 @@ pub async fn start_worker_pool(
                 };
 
                 if let Some(item) = work {
-                    let metrics = Arc::clone(&metrics);
-
-                    // 1. Destructure the WorkItem to separate ownership
                     let WorkItem { packet, responder } = item;
+                    let metrics_clone = Arc::clone(&metrics);
 
                     let result = tokio::task::spawn_blocking(move || {
-                        metrics.processed_tasks.fetch_add(1, Ordering::Relaxed);
+                        metrics_clone.processed_tasks.fetch_add(1, Ordering::Relaxed);
 
-                        // 2. Now only 'packet' is moved into this closure
-                        match packet.algorithm() {
-                            &HashAlgorithms::BLAKE3 => "blake3_placeholder".to_string(),
-                            _ => hash_reader::<Sha256>(packet.path())
-                                .unwrap_or_else(|e| format!("Error: {}", e)),
+                        let algo = packet.algorithm();
+                        let path = packet.path();
+
+                        match algo {
+                            HashAlgorithms::SHA224 => hash_reader::<Sha224>(path),
+                            HashAlgorithms::SHA256 => hash_reader::<Sha256>(path),
+                            HashAlgorithms::SHA384 => hash_reader::<Sha384>(path),
+                            HashAlgorithms::SHA512 => hash_reader::<Sha512>(path),
+                            HashAlgorithms::SHA512_224 => hash_reader::<Sha512_224>(path),
+                            HashAlgorithms::SHA512_256 => hash_reader::<Sha512_256>(path),
+
+                            HashAlgorithms::SHA3_224 => hash_reader::<Sha3_224>(path),
+                            HashAlgorithms::SHA3_256 => hash_reader::<Sha3_256>(path),
+                            HashAlgorithms::SHA3_384 => hash_reader::<Sha3_384>(path),
+                            HashAlgorithms::SHA3_512 => hash_reader::<Sha3_512>(path),
+
+                            HashAlgorithms::BLAKE3 => {
+                                let mut src = match path {
+                                    FilePath::Local(p) => fs::File::open(p).map_err(HashError::Io)?,
+                                    FilePath::Remote(_) => return Err(HashError::NotImplemented),
+                                };
+
+                                let mut hasher = blake3::Hasher::new();
+                                let mut buffer = [0u8; 8192];
+                                loop {
+                                    let count = src.read(&mut buffer).map_err(HashError::Io)?;
+                                    if count == 0 { break; }
+                                    hasher.update(&buffer[..count]);
+                                }
+                                Ok(hasher.finalize().to_hex().to_string())
+                            }
+                            _ => Err(HashError::NotImplemented),
                         }
                     })
-                    .await
-                    .unwrap();
+                    .await;
 
-                    // 3. 'responder' is still available here because it wasn't moved into the closure!
-                    let _ = responder.send(result);
+                    let final_response = match result {
+                        Ok(Ok(h)) => ProtocolMessage::TaskResponse(crate::network::TaskResponse::Success(h)),
+                        Ok(Err(_)) => ProtocolMessage::TaskResponse(crate::network::TaskResponse::Failed),
+                        Err(_) => ProtocolMessage::TaskResponse(crate::network::TaskResponse::Failed),
+                    };
+
+                    let _ = responder.send(final_response);
                 } else {
                     break;
                 }

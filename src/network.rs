@@ -1,79 +1,72 @@
-use crate::workers::Task;
-use crate::protocol::PacketSize;
-use crate::{FilePath, HashAlgorithms};
-use std::fmt;
-use std::string::FromUtf8Error;
-use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
-use tokio::time::Duration;
-use tokio::time::timeout;
-use crate::constants::*;
+use crate::{FilePath, HashAlgorithms, constants::*, protocol::PacketSize};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    io::AsyncReadExt,
+    net::TcpStream,
+    time::{Duration, timeout},
+};
 
-#[derive(Debug)]
-pub enum PacketError {
-    TooShort,
-    Utf8Error(FromUtf8Error),
+#[derive(Debug, thiserror::Error)]
+pub enum ProtocolError {
+    #[error("Packet too short must be more that two bytes")]
+    PacketTooShort,
+
+    #[error("Packet exceeds maximum size of {0} bytes")]
+    PacketTooLarge(usize),
+
+    #[error("Bincode failure: {0}")]
+    Bincode(#[from] Box<bincode::ErrorKind>),
+
+    #[error("Network I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Request has timed out {0}")]
+    TimeOutError(#[from] tokio::time::error::Elapsed),
+
+    #[error("Unknown OpCode: {0}")]
+    UnknownOpCode(u8),
 }
 
-impl fmt::Display for PacketError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PacketError::TooShort => write!(f, "Packet too short"),
-            PacketError::Utf8Error(e) => write!(f, "UTF-8 error: {}", e),
-        }
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ProtocolMessage {
+    TaskRequest(TaskRequest),
+    TaskResponse(TaskResponse)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TaskResponse {
+    Success(String),
+    Failed
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TaskRequest {
+    HashPacket(HashingPacket),
+}
+
+impl ProtocolMessage {
+    pub fn into_packet(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut buffer = vec![0u8; 2];
+
+        bincode::serialize_into(&mut buffer, &self)?;
+
+        let payload_len = (buffer.len() - 2) as u16;
+
+        let len_bytes = payload_len.to_be_bytes();
+        buffer[0] = len_bytes[0];
+        buffer[1] = len_bytes[1];
+
+        Ok(buffer)
     }
 }
 
-impl From<FromUtf8Error> for PacketError {
-    fn from(e: FromUtf8Error) -> Self {
-        PacketError::Utf8Error(e)
-    }
-}
-
-#[derive(Debug)]
-pub struct TaskPacket {
-    task: Task,
-    payload: Vec<u8>,
-}
-impl TaskPacket {
-    pub fn task(&self) -> &Task {
-        &self.task
-    }
-    pub fn payload(&self) -> &Vec<u8> {
-        &self.payload
-    }
-}
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HashingPacket {
-    algorithm: HashAlgorithms,
-    path: FilePath,
+    pub algorithm: HashAlgorithms,
+    pub path: FilePath,
 }
 
 impl HashingPacket {
-    fn from_bytes(v: Vec<u8>) -> Self {
-        assert!(v.len() >= 2, "Packet too short to parse");
-
-        let algorithm = match v[0] {
-            HASH_BLAKE3_CODE => HashAlgorithms::BLAKE3,
-            HASH_SHA256_CODE => HashAlgorithms::SHA256,
-            HASH_SHAKE256_CODE => HashAlgorithms::SHAKE256,
-            _ => HashAlgorithms::UNIMPLEMENTED,
-        };
-
-        let path = match v[1] {
-            0 => FilePath::Local(
-                String::from_utf8(v[2..].to_vec()).unwrap_or_else(|_| "<invalid utf8>".to_string()),
-            ),
-            1 => FilePath::Remote(
-                String::from_utf8(v[2..].to_vec()).unwrap_or_else(|_| "<invalid utf8>".to_string()),
-            ),
-            _ => FilePath::Local(
-                String::from_utf8(v[2..].to_vec()).unwrap_or_else(|_| "<invalid utf8>".to_string()),
-            ),
-        };
-
-        Self { algorithm, path }
-    }
     pub fn algorithm(&self) -> &HashAlgorithms {
         &self.algorithm
     }
@@ -81,46 +74,19 @@ impl HashingPacket {
     pub fn path(&self) -> &FilePath {
         &self.path
     }
-
-    pub fn try_from_bytes(v: Vec<u8>) -> Result<Self, PacketError> {
-        if v.len() < 2 {
-            return Err(PacketError::TooShort);
-        }
-
-        let algorithm = match v[0] {
-            HASH_BLAKE3_CODE => HashAlgorithms::BLAKE3,
-            HASH_SHA256_CODE => HashAlgorithms::SHA256,
-            HASH_SHAKE256_CODE => HashAlgorithms::SHAKE256,
-            _ => HashAlgorithms::UNIMPLEMENTED,
-        };
-
-        let path = match v[1] {
-            0 => FilePath::Local(String::from_utf8(v[2..].to_vec())?),
-            1 => FilePath::Remote(String::from_utf8(v[2..].to_vec())?),
-            _ => FilePath::Local(String::from_utf8(v[2..].to_vec())?),
-        };
-
-        Ok(Self { algorithm, path })
-    }
 }
 
-pub async fn read_task(stream: &mut TcpStream) -> tokio::io::Result<TaskPacket> {
+pub async fn read_protocol(stream: &mut TcpStream) -> Result<ProtocolMessage, ProtocolError> {
     let read_timeout = Duration::from_secs(5);
     let read_future = async {
         let mut len_buf = [0u8; 2];
         stream.read_exact(&mut len_buf).await?;
         let packet_len = PacketSize::from_slice(&len_buf);
 
-        let mut opcode_buf = [0u8; 1];
-        stream.read_exact(&mut opcode_buf).await?;
-
-        let task = Task::from_byte(opcode_buf[0]).ok_or_else(|| {
-            tokio::io::Error::new(tokio::io::ErrorKind::InvalidData, "Unknown task")
-        })?;
-
         let mut payload = vec![0u8; packet_len.into()];
         stream.read_exact(&mut payload).await?;
-        Ok(TaskPacket { task, payload })
+        let task: ProtocolMessage = bincode::deserialize(&payload)?;
+        Ok(task)
     };
 
     timeout(read_timeout, read_future).await?

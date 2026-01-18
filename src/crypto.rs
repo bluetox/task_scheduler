@@ -1,7 +1,9 @@
-use digest::Digest;
-use std::{fmt, fs};
-use std::io::{self, Read};
 use crate::FilePath;
+use digest::Digest;
+use std::{
+    fmt, fs,
+    io::{self, Read},
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HashError {
@@ -11,10 +13,10 @@ pub enum HashError {
     Io(#[from] io::Error),
 }
 
-pub fn hash_reader<D>(path: &FilePath) -> Result<String, HashError> 
-where 
+pub fn hash_reader<D>(path: &FilePath) -> Result<String, HashError>
+where
     D: Digest,
-    digest::Output<D>: fmt::LowerHex, 
+    digest::Output<D>: fmt::LowerHex,
 {
     let mut src = match path {
         FilePath::Local(p) => fs::File::open(p)?,
@@ -26,10 +28,12 @@ where
 
     loop {
         let count = src.read(&mut buffer)?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         hasher.update(&buffer[..count]);
     }
-    
+
     let result = hasher.finalize();
     Ok(format!("{:x}", result))
 }

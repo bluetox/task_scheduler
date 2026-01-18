@@ -1,50 +1,19 @@
-#![allow(dead_code)]
+use task_scheduler::{
+    ServerMetrics,
+    network::{HashingPacket, ProtocolMessage, TaskRequest, read_protocol},
+    workers::{Task, WorkItem, start_worker_pool},
+};
+use serde::{Deserialize, Serialize};
+use std::{fs::read, sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+}};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
 
-use crate::network::HashingPacket;
-use crate::network::read_task;
-use crate::workers::Task;
-use crate::workers::WorkItem;
-use crate::workers::start_worker_pool;
-use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-mod constants;
-mod network;
-mod protocol;
-mod crypto;
-mod workers;
-
-struct ServerMetrics {
-    processed_tasks: AtomicUsize,
-    active_connections: AtomicUsize,
-}
-
-impl ServerMetrics {
-    fn new() -> Self {
-        Self {
-            processed_tasks: AtomicUsize::new(0),
-            active_connections: AtomicUsize::new(0),
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum HashAlgorithms {
-    SHAKE256,
-    SHA256,
-    BLAKE3,
-    UNIMPLEMENTED,
-}
-
-#[derive(Debug)]
-enum FilePath {
-    Local(String),
-    Remote(String),
-}
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
@@ -70,20 +39,23 @@ async fn main() -> tokio::io::Result<()> {
             );
 
             loop {
-                let packet = match read_task(&mut socket).await {
+                let packet = match read_protocol(&mut socket).await {
                     Ok(p) => p,
                     Err(_) => break,
                 };
-
-                if let Task::Hashing = packet.task() {
-                    if let Ok(hash_req) = HashingPacket::try_from_bytes(packet.payload().clone()) {
+                let task = match packet {
+                    ProtocolMessage::TaskRequest(t) => t,
+                    ProtocolMessage::TaskResponse(_) => continue
+                };
+                match task {
+                    TaskRequest::HashPacket(p) => {
                         let (resp_tx, resp_rx) = oneshot::channel();
-                        let work = WorkItem::new(hash_req, resp_tx);
+                        let work = WorkItem::new(p, resp_tx);
 
                         let _ = task_sender.send(work).await;
 
                         if let Ok(result) = resp_rx.await {
-                            let _ = socket.write_all(result.as_bytes()).await;
+                            let _ = socket.write_all(&result.into_packet().unwrap()).await;
 
                             let total = conn_metrics.processed_tasks.load(Ordering::SeqCst);
                             let active = conn_metrics.active_connections.load(Ordering::SeqCst);
