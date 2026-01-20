@@ -3,7 +3,7 @@ use crate::{
     network::{HashingPacket, ProtocolMessage},
 };
 use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
-use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
+use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
 use std::fs;
 use std::io::Read;
 use std::sync::{Arc, atomic::Ordering};
@@ -47,7 +47,7 @@ pub async fn start_worker_pool(
 ) {
     let receiver = Arc::new(Mutex::new(receiver));
 
-    for id in 0..num_workers {
+    for _id in 0..num_workers {
         let rx = Arc::clone(&receiver);
         let metrics = Arc::clone(&metrics);
         

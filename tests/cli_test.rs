@@ -20,7 +20,7 @@ async fn test_client_example() {
     println!("Packet: {:?}", packet);
 }
 
-use rand::RngCore;
+use rand::{RngCore, rng};
 
 #[tokio::test]
 async fn test_random_junk_bytes() {
@@ -28,7 +28,7 @@ async fn test_random_junk_bytes() {
         .expect("Server must be running for this test");
 
     let mut junk_payload = vec![0u8; 100]; 
-    rand::thread_rng().fill_bytes(&mut junk_payload);
+    rng().fill_bytes(&mut junk_payload);
 
     let mut malicious_packet = Vec::new();
     malicious_packet.extend_from_slice(&65000u16.to_be_bytes());
