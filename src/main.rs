@@ -1,19 +1,14 @@
+use std::sync::{Arc, atomic::Ordering};
 use task_scheduler::{
     ServerMetrics,
-    network::{HashingPacket, ProtocolMessage, TaskRequest, read_protocol},
-    workers::{Task, WorkItem, start_worker_pool},
+    network::{ProtocolMessage, TaskRequest, read_protocol},
+    workers::{WorkItem, start_worker_pool},
 };
-use serde::{Deserialize, Serialize};
-use std::{fs::read, sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-}};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
     sync::{mpsc, oneshot},
 };
-
 
 #[tokio::main]
 async fn main() -> tokio::io::Result<()> {
@@ -45,7 +40,7 @@ async fn main() -> tokio::io::Result<()> {
                 };
                 let task = match packet {
                     ProtocolMessage::TaskRequest(t) => t,
-                    ProtocolMessage::TaskResponse(_) => continue
+                    ProtocolMessage::TaskResponse(_) => continue,
                 };
                 match task {
                     TaskRequest::HashPacket(p) => {
@@ -55,7 +50,21 @@ async fn main() -> tokio::io::Result<()> {
                         let _ = task_sender.send(work).await;
 
                         if let Ok(result) = resp_rx.await {
-                            let _ = socket.write_all(&result.into_packet().unwrap()).await;
+                            let packet = match result.into_packet() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    println!("Invalid response from worker");
+                                    continue;
+                                }
+                            };
+
+                            match socket.write_all(&packet).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    println!("Failed to write to the socket: {}", e);
+                                    break;
+                                }
+                            }
 
                             let total = conn_metrics.processed_tasks.load(Ordering::SeqCst);
                             let active = conn_metrics.active_connections.load(Ordering::SeqCst);

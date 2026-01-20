@@ -1,11 +1,17 @@
 use crate::{FilePath, HashAlgorithms, constants::*, protocol::PacketSize};
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::AsyncReadExt,
     net::TcpStream,
     time::{Duration, timeout},
 };
-
+fn bincode_config() -> impl bincode::Options {
+    bincode::DefaultOptions::new()
+        .with_limit(MAX_PACKET_SIZE as u64)
+        .with_big_endian()
+        .with_fixint_encoding()
+}
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("Packet too short must be more that two bytes")]
@@ -23,6 +29,9 @@ pub enum ProtocolError {
     #[error("Request has timed out {0}")]
     TimeOutError(#[from] tokio::time::error::Elapsed),
 
+    #[error("Structure was too big to send")]
+    InternalLimitExceeded,
+
     #[error("Unknown OpCode: {0}")]
     UnknownOpCode(u8),
 }
@@ -30,13 +39,13 @@ pub enum ProtocolError {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ProtocolMessage {
     TaskRequest(TaskRequest),
-    TaskResponse(TaskResponse)
+    TaskResponse(TaskResponse),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TaskResponse {
     Success(String),
-    Failed
+    Failed,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,20 +55,25 @@ pub enum TaskRequest {
 
 impl ProtocolMessage {
     pub fn into_packet(&self) -> Result<Vec<u8>, ProtocolError> {
-        let mut buffer = vec![0u8; 2];
+        let payload_size = bincode_config()
+            .serialized_size(self)
+            .map_err(|e| ProtocolError::Bincode(e))? as usize;
 
-        bincode::serialize_into(&mut buffer, &self)?;
+        if payload_size > MAX_PACKET_SIZE {
+            return Err(ProtocolError::PacketTooLarge(payload_size));
+        }
 
-        let payload_len = (buffer.len() - 2) as u16;
+        let mut buffer = Vec::with_capacity(4 + payload_size);
 
-        let len_bytes = payload_len.to_be_bytes();
-        buffer[0] = len_bytes[0];
-        buffer[1] = len_bytes[1];
+        buffer.extend_from_slice(&(payload_size as u32).to_be_bytes());
+
+        bincode_config()
+            .serialize_into(&mut buffer, self)
+            .map_err(|e| ProtocolError::Bincode(e))?;
 
         Ok(buffer)
     }
 }
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HashingPacket {
     pub algorithm: HashAlgorithms,
@@ -79,13 +93,19 @@ impl HashingPacket {
 pub async fn read_protocol(stream: &mut TcpStream) -> Result<ProtocolMessage, ProtocolError> {
     let read_timeout = Duration::from_secs(5);
     let read_future = async {
-        let mut len_buf = [0u8; 2];
+        let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
-        let packet_len = PacketSize::from_slice(&len_buf);
+        let packet_size = PacketSize::from_slice(&len_buf)?;
 
-        let mut payload = vec![0u8; packet_len.into()];
+        let len = packet_size.into();
+
+        if len > MAX_PACKET_SIZE {
+            return Err(ProtocolError::PacketTooLarge(len));
+        }
+        let mut payload = vec![0u8; len];
         stream.read_exact(&mut payload).await?;
-        let task: ProtocolMessage = bincode::deserialize(&payload)?;
+        let task: ProtocolMessage = bincode_config().deserialize(&payload)?;
+
         Ok(task)
     };
 

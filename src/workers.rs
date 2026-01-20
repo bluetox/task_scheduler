@@ -52,7 +52,6 @@ pub async fn start_worker_pool(
         let metrics = Arc::clone(&metrics);
         
         tokio::spawn(async move {
-            println!("Worker {} started", id);
             loop {
                 let work = {
                     let mut lock = rx.lock().await;
