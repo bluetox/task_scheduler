@@ -1,6 +1,6 @@
 use crate::{
-    FilePath, HashAlgorithms, ServerMetrics, constants::*, crypto::HashError, crypto::hash_reader,
-    network::{HashingPacket, ProtocolMessage},
+    FilePath, HashAlgorithms, ServerMetrics, crypto::HashError, crypto::hash_reader,
+    protocol::{HashingPacket, ProtocolMessage},
 };
 use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
 use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
@@ -9,37 +9,64 @@ use std::io::Read;
 use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-#[derive(Debug, Copy, Clone)]
+/// High-level classification of tasks supported by the worker pool.
+///
+/// This enum is used to categorize work before it is dispatched, allowing 
+/// for specialized handling or priority queuing of different task types.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Task {
+    /// A task dedicated to calculating file checksums.
     Hashing,
+    /// Placeholder for future non-hashing operations (e.g., File Compression).
     Other,
 }
 
-impl Task {
-    pub fn from_byte(byte: u8) -> Option<Task> {
-        match byte {
-            HASHING_TASK_CODE => Some(Task::Hashing),
-            OTHER_TASK_CODE => Some(Task::Other),
-            _ => None,
-        }
-    }
-}
+/// Orchestrates a thread pool for executing CPU-bound cryptographic tasks.
+///
+/// This module implements the "Fan-out" pattern. It consumes [`WorkItem`]s from a 
+/// shared queue and distributes them across a fixed number of asynchronous workers.
+/// Heavy hashing operations are offloaded to a blocking thread pool to prevent 
+/// starving the asynchronous runtime.
 
+/// A unit of work consisting of a task payload and a feedback channel.
+///
+/// Each `WorkItem` contains a [`HashingPacket`] and a [`oneshot::Sender`] used to 
+/// communicate the result back to the original request handler.
 pub struct WorkItem {
     packet: HashingPacket,
     responder: oneshot::Sender<ProtocolMessage>,
 }
 
 impl WorkItem {
+    /// Creates a new work envelope for the worker pool.
+    ///
+    /// # Arguments
+    /// * `packet` - The data defining the task to be performed.
+    /// * `responder` - A [`oneshot::Sender`] used to transmit the result back 
+    ///   to the client's connection handler.
     #[inline]
+    #[must_use]
     pub fn new(packet: HashingPacket, responder: oneshot::Sender<ProtocolMessage>) -> Self {
         Self { packet, responder }
     }
 
+    /// Provides a read-only reference to the task's data packet.
     pub fn packet(&self) -> &HashingPacket {
         &self.packet
     }
 }
+
+/// Initializes and starts a pool of worker tasks.
+///
+/// # Arguments
+/// * `receiver` - An MPSC channel receiver used to listen for incoming tasks.
+/// * `num_workers` - The number of concurrent asynchronous tasks to spawn.
+/// * `metrics` - Shared atomic counters for tracking system health and throughput.
+///
+/// # Threading
+/// Each worker runs in an infinite loop, asynchronously waiting for tasks. When a 
+/// task is received, it uses [`tokio::task::spawn_blocking`] to handle the 
+/// computationally expensive hashing, ensuring the orchestrator remains responsive.
 pub async fn start_worker_pool(
     receiver: mpsc::Receiver<WorkItem>,
     num_workers: usize,
@@ -102,9 +129,9 @@ pub async fn start_worker_pool(
                     .await;
 
                     let final_response = match result {
-                        Ok(Ok(h)) => ProtocolMessage::TaskResponse(crate::network::TaskResponse::Success(h)),
-                        Ok(Err(_)) => ProtocolMessage::TaskResponse(crate::network::TaskResponse::Failed),
-                        Err(_) => ProtocolMessage::TaskResponse(crate::network::TaskResponse::Failed),
+                        Ok(Ok(h)) => ProtocolMessage::TaskResponse(crate::protocol::TaskResponse::Success(h)),
+                        Ok(Err(_)) => ProtocolMessage::TaskResponse(crate::protocol::TaskResponse::Failed),
+                        Err(_) => ProtocolMessage::TaskResponse(crate::protocol::TaskResponse::Failed),
                     };
 
                     let _ = responder.send(final_response);

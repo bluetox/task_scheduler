@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::Ordering};
 use task_scheduler::{
     ServerMetrics,
-    network::{ProtocolMessage, TaskRequest, read_protocol},
+    protocol::{ProtocolMessage, TaskRequest, read_protocol},
     workers::{WorkItem, start_worker_pool},
 };
 use tokio::{

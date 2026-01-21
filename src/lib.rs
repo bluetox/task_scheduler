@@ -1,10 +1,30 @@
 #![allow(dead_code)]
+#![deny(missing_docs)]
+
+//! # Task Scheduler
+//! 
+//! A Task Scheduler build to be highly modulable, performant and asynchrous
+//! 
+//! This crate provides the core networking, crypto and protocol logic
+//! for distributing tasks between a central orchestrator and workers.
+//! 
+//! ## Features
+//! - **Asynchronous I/O**: Built on the [Tokio](https://tokio.rs) runtime.
+//! - **Robust Protocol**: A custom protocol that uses bincode serialization to make parsing fast and safe.
+//! - **Security**: Enforced packet size limits and read timeouts to prevent DoS.
+//! - **Type-Safe**: Unified [`ProtocolMessage`] enum for all client-server communication for easy packet handling.
+//!
+//! ## Architecture
+//! The project is divided into three main pillars:
+//! 2. [`protocol`]: Defines the data structures and enums shared by client and server as well as the packet logic.
+//! 3. [`workers`]: Contains the logic to dispatch and execute tasks.
+
 
 use crate::workers::start_worker_pool;
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -12,29 +32,58 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
+
+
+/// Global constants used in the protocol
+/// 
+/// This module defines the constants used in the protocol such as [`MAX_PACKET_SIZE`]
 pub mod constants;
+/// Module to handle cryptographic tasks
+/// 
+/// This modules defines function related to encryption as well as 
+/// §any tasks around crypto.
 pub mod crypto;
-pub mod network;
+/// Module to centralize all of the protocol logic
+/// 
+/// This module defines any function or structure related to the network 
+/// protocol.
 pub mod protocol;
+/// Module that handles the dispatching of tasks
+/// 
+/// This module defines the functions and helpers that do the actual
+/// task dispatch.
 pub mod workers;
 
+
+/// Thread-safe metrics for monitoring the orchestrator's state.
+///
+/// This structure uses atomic integers to allow high-concurrency updates
+/// without the overhead of locking. It is typically wrapped in an [`std::sync::Arc`]
+/// and shared between the listener loop and worker tasks.
 pub struct ServerMetrics {
-    pub processed_tasks: AtomicUsize,
-    pub active_connections: AtomicUsize,
+    /// The total number of tasks successfully processed since the server started.
+    pub processed_tasks: AtomicU64,
+    /// The number of clients currently connected to the orchestrator.
+    pub active_connections: AtomicU64,
 }
 
 impl ServerMetrics {
+    /// Creates a new instance of [`ServerMetrics`] with all counters initialized to zero.
+    #[inline]
     pub fn new() -> Self {
         Self {
-            processed_tasks: AtomicUsize::new(0),
-            active_connections: AtomicUsize::new(0),
+            processed_tasks: AtomicU64::new(0),
+            active_connections: AtomicU64::new(0),
         }
     }
 }
 
+/// Supported hash algorithms used by the protocol for integrity checks
+/// and selection based on client/server capabilities.
+#[allow(missing_docs)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum HashAlgorithms {
-    SHA224,
+    SHA224, 
     SHA256,
     SHA384,
     SHA512,
@@ -52,16 +101,24 @@ pub enum HashAlgorithms {
 
     UNIMPLEMENTED,
 }
+/// Represents a path to a resource in the system or remotely fetched.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum FilePath {
+    /// Local is used for files on the computer
     Local(String),
+    /// Remote is for links online
     Remote(String),
 }
 
-use crate::network::{read_protocol, ProtocolMessage, TaskRequest};
+use crate::protocol::{read_protocol, ProtocolMessage, TaskRequest};
 use crate::workers::WorkItem;
 
 
+/// Start the server loop on an existing TCP listener.
+///
+/// This function accepts incoming connections, updates connection metrics, and delegates
+/// work items to a worker pool. It returns when the underlying I/O fails or the connection
+/// is closed.
 pub async fn run_server_on(listener: TcpListener, num_workers: usize) -> tokio::io::Result<()> {
     let metrics = Arc::new(ServerMetrics::new());
     let (tx, rx) = mpsc::channel::<WorkItem>(100);
@@ -137,6 +194,10 @@ pub async fn run_server_on(listener: TcpListener, num_workers: usize) -> tokio::
     }
 }
 
+/// Bind to the given address and start the server with a worker pool.
+///
+/// This function creates a TCP listener on the provided address and delegates all
+/// incoming work to the worker pool managed by [`run_server_on`].
 pub async fn run_server(addr: &str, num_workers: usize) -> tokio::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     println!("Server listening on {}", addr);
